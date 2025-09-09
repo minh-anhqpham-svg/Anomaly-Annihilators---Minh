@@ -1,0 +1,671 @@
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+
+# Define the path to the log file
+log_file_path = '/content/conn.log.labeled'
+
+# Read the file line by line
+with open(log_file_path, 'r') as f:
+    lines = f.readlines()
+
+# Find the header line (starts with #fields) and the types line (starts with #types)
+header_line = None
+types_line = None
+data_start_index = -1
+
+for i, line in enumerate(lines):
+    if line.startswith('#fields'):
+        header_line = line.strip()
+    elif line.startswith('#types'):
+        types_line = line.strip()
+        data_start_index = i + 1 # Data starts after the types line
+    elif not line.startswith('#'):
+        # Stop searching for header/types once data lines are encountered
+        break
+
+# Parse the header line to get column names
+if header_line:
+    # Remove '#fields\t' prefix
+    header_parts = header_line.replace('#fields\t', '').split('\t')
+    # The last part contains multiple column names separated by spaces
+    # Assuming the last part is 'tunnel_parents label detailed-label'
+    last_part = header_parts[-1]
+    last_cols = last_part.split()
+    columns = header_parts[:-1] + last_cols
+else:
+    raise ValueError("Header line not found in the log file.")
+
+# Determine the number of columns before the last three (tunnel_parents, label, detailed-label)
+num_initial_cols = len(columns) - 3
+
+# Parse data rows with more robust splitting for the last columns
+data_rows_split = []
+if data_start_index != -1:
+    for line in lines[data_start_index:]:
+        if line.strip() and not line.startswith('#'): # Ensure the line is not empty or a comment
+            row_data = line.strip().split('\t')
+
+            # Check if there are enough initial columns separated by tab
+            if len(row_data) >= num_initial_cols:
+                initial_cols_data = row_data[:num_initial_cols]
+                # The rest of the line should contain the last three columns
+                remaining_part = '\t'.join(row_data[num_initial_cols:])
+
+                # Split the remaining part by spaces to get the last three columns
+                last_cols_data = remaining_part.split()
+
+                # Ensure we get exactly 3 columns from the last part
+                if len(last_cols_data) == 3:
+                    full_row_data = initial_cols_data + last_cols_data
+                    # Check if the total number of columns matches the header
+                    if len(full_row_data) == len(columns):
+                        data_rows_split.append(full_row_data)
+                    else:
+                         print(f"Skipping row due to final column count mismatch. Expected {len(columns)}, got {len(full_row_data)}: {line.strip()}")
+                else:
+                     print(f"Skipping row due to incorrect number of last columns ({len(last_cols_data)} instead of 3): {line.strip()}")
+            else:
+                print(f"Skipping row due to insufficient initial columns ({len(row_data)}): {line.strip()}")
+
+else:
+    raise ValueError("Data start index not found in the log file.")
+
+# Create a pandas DataFrame
+df = pd.DataFrame(data_rows_split, columns=columns)
+
+# Ensure 'label' column is treated as string and strip whitespace
+if 'label' in df.columns:
+    df['label'] = df['label'].astype(str).str.strip()
+else:
+    raise ValueError("'label' column not found in DataFrame after parsing.")
+
+# Define the correct label mapping
+label_mapping = {'Benign': 0, 'Malicious': 1}
+
+# Map the stripped labels to numerical values, handling potential missing/unexpected values with NaN
+df['label'] = df['label'].map(label_mapping)
+
+# Identify columns to coerce to numeric (exclude 'uid', 'detailed-label', and the 'label' column which is now numeric)
+numeric_cols = [col for col in df.columns if col not in ['uid', 'detailed-label', 'label']]
+
+# Coerce identified columns to numeric types, coercing errors to NaN
+for col in tqdm(numeric_cols, desc="Coercing to numeric"):
+    df[col] = pd.to_numeric(df[col], errors='coerce')
+
+# Print the shape of the final DataFrame
+print("\nDataFrame shape:", df.shape)
+
+# Print the value counts for the 'label' column
+print("\nLabel distribution:\n", df['label'].value_counts(dropna=False))
+
+import numpy as np
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+
+# 1. Create derived features
+# Handle potential division by zero by adding a small epsilon or checking for zero
+epsilon = 1e-6
+
+# Bytes per packet (handling zero packets)
+df['orig_bytes_per_pkt'] = df['orig_bytes'] / (df['orig_pkts'] + epsilon)
+df['resp_bytes_per_pkt'] = df['resp_bytes'] / (df['resp_pkts'] + epsilon)
+
+# Duration per byte (handling zero bytes and zero duration)
+df['duration_per_orig_byte'] = df['duration'] / (df['orig_bytes'] + epsilon)
+df['duration_per_resp_byte'] = df['duration'] / (df['resp_bytes'] + epsilon)
+
+# Packet rate (handling zero duration)
+df['orig_pkt_rate'] = df['orig_pkts'] / (df['duration'] + epsilon)
+df['resp_pkt_rate'] = df['resp_pkts'] / (df['duration'] + epsilon)
+
+# Byte rate (handling zero duration)
+df['orig_byte_rate'] = df['orig_bytes'] / (df['duration'] + epsilon)
+df['resp_byte_rate'] = df['resp_bytes'] / (df['duration'] + epsilon)
+
+# Ratio of origin to response bytes/packets
+df['orig_resp_byte_ratio'] = df['orig_bytes'] / (df['resp_bytes'] + epsilon)
+df['orig_resp_pkt_ratio'] = df['orig_pkts'] / (df['resp_pkts'] + epsilon)
+
+# 2. Identify numerical and categorical features
+# Exclude 'label', 'uid', and 'detailed-label'
+excluded_cols = ['label', 'uid', 'detailed-label']
+all_features = [col for col in df.columns if col not in excluded_cols]
+
+# Separate numerical and categorical features based on dtype
+numerical_features = df[all_features].select_dtypes(include=np.number).columns.tolist()
+categorical_features = df[all_features].select_dtypes(include='object').columns.tolist()
+
+print("Numerical features:", numerical_features)
+print("Categorical features:", categorical_features)
+
+# 3. Define preprocessing steps for numerical features
+# Impute with median, then scale
+numerical_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', StandardScaler())
+])
+
+# 4. Define preprocessing steps for categorical features
+# Impute with a constant 'missing', then one-hot encode
+categorical_transformer = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+    ('onehot', OneHotEncoder(handle_unknown='ignore'))
+])
+
+# 5. Build a ColumnTransformer
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', numerical_transformer, numerical_features),
+        ('cat', categorical_transformer, categorical_features)
+    ])
+
+print("\nColumnTransformer built successfully.")
+display(df.head())
+
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.pipeline import Pipeline
+
+# Create the Random Forest pipeline
+rf_pipeline = Pipeline(steps=[('preprocessor', preprocessor),
+                              ('classifier', RandomForestClassifier(random_state=42))])
+
+# Fit the pipeline to the entire DataFrame
+# X should be all columns except 'label', 'uid', and 'detailed-label'
+# y should be the 'label' column
+X = df.drop(columns=['label', 'uid', 'detailed-label'])
+y = df['label']
+
+# Ensure there are no NaNs in the target variable before fitting
+if y.isnull().sum() > 0:
+    print(f"Warning: {y.isnull().sum()} NaN values found in target variable 'label'. Dropping rows with NaN labels for training.")
+    # Drop rows with NaN labels from both X and y
+    nan_label_indices = y[y.isnull()].index
+    X = X.drop(nan_label_indices)
+    y = y.drop(nan_label_indices)
+
+
+trained_rf_pipeline = rf_pipeline.fit(X, y)
+
+print("RandomForestClassifier pipeline trained successfully.")
+
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report, confusion_matrix
+import joblib
+import json
+import os
+import numpy as np
+
+# Define output_dir and create the directory if it doesn't exist
+output_dir = 'output'
+os.makedirs(output_dir, exist_ok=True)
+
+# 1. Use the trained_rf_pipeline to make predictions on X
+y_pred = trained_rf_pipeline.predict(X)
+
+# 2. Calculate evaluation metrics
+accuracy = accuracy_score(y, y_pred)
+precision = precision_score(y, y_pred, zero_division=1) # Handle cases with no positive predictions
+recall = recall_score(y, y_pred, zero_division=1)     # Handle cases with no positive labels
+f1 = f1_score(y, y_pred, zero_division=1)           # Handle cases with no positive predictions or labels
+
+# 3. Generate classification report and confusion matrix
+class_report = classification_report(y, y_pred, target_names=['Benign', 'Malicious'], zero_division=1)
+conf_matrix = confusion_matrix(y, y_pred)
+
+# 5. Print the evaluation metrics, classification report, and confusion matrix
+print("Evaluation Metrics:")
+print(f"Accuracy: {accuracy:.4f}")
+print(f"Precision: {precision:.4f}")
+print(f"Recall: {recall:.4f}")
+print(f"F1-score: {f1:.4f}")
+
+print("\nClassification Report:")
+print(class_report)
+
+print("\nConfusion Matrix:")
+print(conf_matrix)
+
+
+# 6. Save the trained_rf_pipeline to a file
+model_path = os.path.join(output_dir, 'trained_rf_pipeline.joblib')
+joblib.dump(trained_rf_pipeline, model_path)
+print(f"\nTrained RandomForestClassifier pipeline saved to {model_path}")
+
+# 7. Save the evaluation results to a file
+# Save metrics to a JSON file
+evaluation_metrics = {
+    'accuracy': accuracy,
+    'precision': precision,
+    'recall': recall,
+    'f1_score': f1
+}
+metrics_path = os.path.join(output_dir, 'rf_evaluation_metrics.json')
+with open(metrics_path, 'w') as f:
+    json.dump(evaluation_metrics, f, indent=4)
+print(f"Evaluation metrics saved to {metrics_path}")
+
+# Save classification report and confusion matrix to a text file
+report_path = os.path.join(output_dir, 'rf_evaluation_report.txt')
+with open(report_path, 'w') as f:
+    f.write("Evaluation Metrics:\n")
+    f.write(f"Accuracy: {accuracy:.4f}\n")
+    f.write(f"Precision: {precision:.4f}\n")
+    f.write(f"Recall: {recall:.4f}\n")
+    f.write(f"F1-score: {f1:.4f}\n")
+    f.write("\nClassification Report:\n")
+    f.write(class_report)
+    f.write("\nConfusion Matrix:\n")
+    f.write(np.array2string(conf_matrix)) # Use np.array2string for consistent formatting
+print(f"Evaluation report saved to {report_path}")
+
+from sklearn.ensemble import IsolationForest
+from sklearn.pipeline import Pipeline
+
+# 2. Create a pipeline named if_pipeline
+# The preprocessor was defined in a previous subtask
+if_pipeline = Pipeline(steps=[('preprocessor', preprocessor),
+                              ('model', IsolationForest(random_state=42))])
+
+# 3. Fit the if_pipeline to the feature data X
+# X was already defined in a previous subtask as df without label, uid, and detailed-label
+# Ensure X is the DataFrame excluding the specified columns, just in case the environment changed
+X = df.drop(columns=['label', 'uid', 'detailed-label'])
+
+# Fit the pipeline to the feature data X
+trained_if_pipeline = if_pipeline.fit(X)
+
+print("IsolationForest pipeline trained successfully.")
+
+import joblib
+import json
+import os
+import numpy as np
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
+
+# Define output_dir if it's not already in the environment (should be from previous steps)
+# output_dir = 'output' # Uncomment if needed
+# os.makedirs(output_dir, exist_ok=True) # Uncomment if needed
+
+# Ensure X and y are correctly defined from the original df
+X = df.drop(columns=['label', 'uid', 'detailed-label'])
+y = df['label']
+
+# Handle potential NaNs in X by imputing before prediction if preprocessor doesn't handle it
+# The preprocessor in the pipeline already handles imputation, so we can directly use X
+# If there were NaNs in y, they were handled during the RF training. Ensure y is clean for IF evaluation.
+# Based on previous steps, y should be clean (no NaNs).
+
+# 2. Predict anomaly scores
+anomaly_scores = trained_if_pipeline.decision_function(X)
+
+# 3. Predict anomaly labels (1 for inliers, -1 for outliers)
+if_predictions = trained_if_pipeline.predict(X)
+
+# 4. Convert anomaly labels (-1, 1) to match target variable labels (1 for malicious, 0 for benign)
+# Isolation Forest: -1 (outlier/malicious), 1 (inlier/benign)
+# Target variable: 1 (malicious), 0 (benign)
+# Mapping: -1 -> 1, 1 -> 0
+converted_labels = np.where(if_predictions == -1, 1, 0)
+
+# 5. Calculate evaluation metrics
+# Use zero_division=1 to handle cases with no positive predictions
+accuracy = accuracy_score(y, converted_labels)
+precision = precision_score(y, converted_labels, zero_division=1)
+recall = recall_score(y, converted_labels, zero_division=1)
+f1 = f1_score(y, converted_labels, zero_division=1)
+
+# 6. Print the calculated evaluation metrics
+print("Isolation Forest Evaluation Metrics:")
+print(f"Accuracy: {accuracy:.4f}")
+print(f"Precision: {precision:.4f}")
+print(f"Recall: {recall:.4f}")
+print(f"F1-score: {f1:.4f}")
+
+# 7. Generate and print the classification report
+class_report = classification_report(y, converted_labels, target_names=['Benign', 'Malicious'], zero_division=1)
+print("\nClassification Report:")
+print(class_report)
+
+# 8. Generate and print the confusion matrix
+conf_matrix = confusion_matrix(y, converted_labels)
+print("\nConfusion Matrix:")
+print(conf_matrix)
+
+# 9. Save the trained_if_pipeline to a file
+model_path = os.path.join(output_dir, 'trained_if_pipeline.joblib')
+joblib.dump(trained_if_pipeline, model_path)
+print(f"\nTrained IsolationForest pipeline saved to {model_path}")
+
+# 10. Save the evaluation metrics to a JSON file
+evaluation_metrics = {
+    'accuracy': accuracy,
+    'precision': precision,
+    'recall': recall,
+    'f1_score': f1
+}
+metrics_path = os.path.join(output_dir, 'if_evaluation_metrics.json')
+with open(metrics_path, 'w') as f:
+    json.dump(evaluation_metrics, f, indent=4)
+print(f"Evaluation metrics saved to {metrics_path}")
+
+# 11. Save classification report and confusion matrix to a text file
+report_path = os.path.join(output_dir, 'if_evaluation_report.txt')
+with open(report_path, 'w') as f:
+    f.write("Isolation Forest Evaluation Metrics:\n")
+    f.write(f"Accuracy: {accuracy:.4f}\n")
+    f.write(f"Precision: {precision:.4f}\n")
+    f.write(f"Recall: {recall:.4f}\n")
+    f.write(f"F1-score: {f1:.4f}\n")
+    f.write("\nClassification Report:\n")
+    f.write(class_report)
+    f.write("\nConfusion Matrix:\n")
+    f.write(np.array2string(conf_matrix))
+print(f"Evaluation report saved to {report_path}")
+
+import joblib
+import os
+
+# Define output_dir if it's not already in the environment (should be from previous steps)
+output_dir = 'output'
+
+# Define the file paths for the saved pipelines
+rf_model_path = os.path.join(output_dir, 'trained_rf_pipeline.joblib')
+if_model_path = os.path.join(output_dir, 'trained_if_pipeline.joblib')
+
+# Load the trained RandomForestClassifier pipeline
+loaded_rf_pipeline = joblib.load(rf_model_path)
+print(f"RandomForestClassifier pipeline loaded from {rf_model_path}")
+
+# Load the trained IsolationForest pipeline
+loaded_if_pipeline = joblib.load(if_model_path)
+print(f"IsolationForest pipeline loaded from {if_model_path}")
+
+# Define the path to the new log file
+new_log_file_path = '/content/conn.log.labeled' # Assuming new data is in the same file for demonstration
+
+# Read the new file line by line
+with open(new_log_file_path, 'r') as f:
+    new_lines = f.readlines()
+
+# Find the header line and the types line in the new data
+new_header_line = None
+new_types_line = None
+new_data_start_index = -1
+
+for i, line in enumerate(new_lines):
+    if line.startswith('#fields'):
+        new_header_line = line.strip()
+    elif line.startswith('#types'):
+        new_types_line = line.strip()
+        new_data_start_index = i + 1 # Data starts after the types line
+    elif not line.startswith('#'):
+        # Stop searching for header/types once data lines are encountered
+        break
+
+# Parse the header line to get column names for the new data
+if new_header_line:
+    # Remove '#fields\t' prefix
+    new_header_parts = new_header_line.replace('#fields\t', '').split('\t')
+    # The last part contains multiple column names separated by spaces
+    last_part = new_header_parts[-1]
+    last_cols = last_part.split()
+    new_columns = new_header_parts[:-1] + last_cols
+else:
+    raise ValueError("Header line not found in the new log file.")
+
+# Determine the number of columns before the last three (tunnel_parents, label, detailed-label)
+new_num_initial_cols = len(new_columns) - 3
+
+# Parse data rows from the new file with robust splitting for the last columns
+new_data_rows_split = []
+if new_data_start_index != -1:
+    for line in new_lines[new_data_start_index:]:
+        if line.strip() and not line.startswith('#'): # Ensure the line is not empty or a comment
+            row_data = line.strip().split('\t')
+
+            # Check if there are enough initial columns separated by tab
+            if len(row_data) >= new_num_initial_cols:
+                initial_cols_data = row_data[:new_num_initial_cols]
+                # The rest of the line should contain the last three columns
+                remaining_part = '\t'.join(row_data[new_num_initial_cols:])
+
+                # Split the remaining part by spaces to get the last three columns
+                last_cols_data = remaining_part.split()
+
+                # Ensure we get exactly 3 columns from the last part
+                if len(last_cols_data) == 3:
+                    full_row_data = initial_cols_data + last_cols_data
+                    # Check if the total number of columns matches the header
+                    if len(full_row_data) == len(new_columns):
+                        new_data_rows_split.append(full_row_data)
+                    else:
+                         print(f"Skipping new row due to final column count mismatch. Expected {len(new_columns)}, got {len(full_row_data)}: {line.strip()}")
+                else:
+                     print(f"Skipping new row due to incorrect number of last columns ({len(last_cols_data)} instead of 3): {line.strip()}")
+            else:
+                print(f"Skipping new row due to insufficient initial columns ({len(row_data)}): {line.strip()}")
+else:
+    raise ValueError("New data start index not found in the new log file.")
+
+# Create a pandas DataFrame for the new data
+new_df = pd.DataFrame(new_data_rows_split, columns=new_columns)
+
+# Display the first few rows of the new DataFrame
+display(new_df.head())
+
+# Identify columns to coerce to numeric in the new data (exclude 'uid', 'detailed-label', and 'label')
+# Note: 'label' column might still exist in new_df as a string before dropping
+numeric_cols_new = [col for col in new_df.columns if col not in ['uid', 'detailed-label', 'label']]
+
+# Coerce identified columns to numeric types, coercing errors to NaN
+for col in numeric_cols_new:
+    new_df[col] = pd.to_numeric(new_df[col], errors='coerce')
+
+# 1. Create the same derived features on the new data
+# Handle potential division by zero by adding a small epsilon or checking for zero
+epsilon = 1e-6
+
+# Bytes per packet (handling zero packets)
+new_df['orig_bytes_per_pkt'] = new_df['orig_bytes'] / (new_df['orig_pkts'] + epsilon)
+new_df['resp_bytes_per_pkt'] = new_df['resp_bytes'] / (new_df['resp_pkts'] + epsilon)
+
+# Duration per byte (handling zero bytes and zero duration)
+new_df['duration_per_orig_byte'] = new_df['duration'] / (new_df['orig_bytes'] + epsilon)
+new_df['duration_per_resp_byte'] = new_df['duration'] / (new_df['resp_bytes'] + epsilon)
+
+# Packet rate (handling zero duration)
+new_df['orig_pkt_rate'] = new_df['orig_pkts'] / (new_df['duration'] + epsilon)
+new_df['resp_pkt_rate'] = new_df['resp_pkts'] / (new_df['duration'] + epsilon)
+
+# Byte rate (handling zero duration)
+new_df['orig_byte_rate'] = new_df['orig_bytes'] / (new_df['duration'] + epsilon)
+new_df['resp_byte_rate'] = new_df['resp_bytes'] / (new_df['duration'] + epsilon)
+
+# Ratio of origin to response bytes/packets
+new_df['orig_resp_byte_ratio'] = new_df['orig_bytes'] / (new_df['resp_bytes'] + epsilon)
+new_df['orig_resp_pkt_ratio'] = new_df['orig_pkts'] / (new_df['resp_pkts'] + epsilon)
+
+# 2. Exclude non-feature columns and apply the preprocessor
+X_new = new_df.drop(columns=['label', 'uid', 'detailed-label'])
+
+# Apply the preprocessor to the new data
+X_new_processed = preprocessor.transform(X_new)
+
+print("New data preprocessed successfully.")
+print("Shape of preprocessed new data:", X_new_processed.shape)
+
+import numpy as np
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+
+# Re-identify numerical and categorical features from the original df structure before derived features
+# Exclude 'label', 'uid', and 'detailed-label'
+excluded_cols = ['label', 'uid', 'detailed-label']
+all_original_cols = [col for col in df.columns if col not in excluded_cols]
+
+# Separate numerical and categorical features based on dtype from the original df
+numerical_features_original = df[all_original_cols].select_dtypes(include=np.number).columns.tolist()
+categorical_features_original = df[all_original_cols].select_dtypes(include='object').columns.tolist()
+
+print("Original Numerical features:", numerical_features_original)
+print("Original Categorical features:", categorical_features_original)
+
+
+# Redefine preprocessing steps for numerical features
+numerical_transformer_redefined = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='median')),
+    ('scaler', StandardScaler())
+])
+
+# Redefine preprocessing steps for categorical features
+categorical_transformer_redefined = Pipeline(steps=[
+    ('imputer', SimpleImputer(strategy='constant', fill_value='missing')),
+    ('onehot', OneHotEncoder(handle_unknown='ignore'))
+])
+
+# Rebuild the ColumnTransformer using the correctly identified features
+preprocessor_redefined = ColumnTransformer(
+    transformers=[
+        ('num', numerical_transformer_redefined, numerical_features_original),
+        ('cat', categorical_transformer_redefined, categorical_features_original)
+    ],
+    remainder='passthrough' # Keep other columns (shouldn't be any after dropping)
+)
+
+print("\nColumnTransformer rebuilt successfully with correct features.")
+
+# Re-apply the preprocessor to the original training data (X) to check output shape
+# X was defined as df.drop(columns=['label', 'uid', 'detailed-label']) after derived features were added
+# Need to re-create X from df AFTER derived features are added but BEFORE dropping label/uid/detailed-label
+# Let's recreate X based on the state of df when preprocessor was originally fitted
+# X should have included the derived features.
+X_for_fitting = df.drop(columns=['label', 'uid', 'detailed-label'])
+
+# Fit the preprocessor on X_for_fitting
+preprocessor_redefined.fit(X_for_fitting)
+
+# Transform the original training data X_for_fitting using the redefined preprocessor
+X_processed_redefined = preprocessor_redefined.transform(X_for_fitting)
+
+print("\nShape of re-processed original training data:", X_processed_redefined.shape)
+
+# Now, re-create X_new from new_df AFTER derived features are added but BEFORE dropping label/uid/detailed-label
+X_new_for_transform = new_df.drop(columns=['label', 'uid', 'detailed-label'])
+
+# Ensure the columns in X_new_for_transform match the columns in X_for_fitting
+X_new_for_transform = X_new_for_transform[X_for_fitting.columns]
+
+
+# Apply the redefined preprocessor to the new data X_new_for_transform
+X_new_processed_redefined = preprocessor_redefined.transform(X_new_for_transform)
+
+print("Shape of re-preprocessed new data:", X_new_processed_redefined.shape)
+
+# Now, use the loaded_rf_pipeline (which contains the original preprocessor, but the error seems to be
+# specifically when the preprocessor.transform is called within the pipeline)
+# Let's try using the newly defined and fitted preprocessor's output directly with the RF classifier part of the pipeline.
+# Alternatively, the issue might be with the loaded_rf_pipeline using the old preprocessor definition.
+# Let's re-fit the entire RF pipeline with the redefined preprocessor.
+
+# Re-create the Random Forest pipeline with the redefined preprocessor
+rf_pipeline_redefined = Pipeline(steps=[('preprocessor', preprocessor_redefined),
+                                       ('classifier', RandomForestClassifier(random_state=42))])
+
+# Fit the redefined pipeline to the original training data (X_for_fitting and y)
+# y is the 'label' column from df
+y = df['label'].dropna() # Ensure y is clean as before
+X_for_fitting_cleaned = X_for_fitting.loc[y.index] # Align X with clean y
+
+trained_rf_pipeline_redefined = rf_pipeline_redefined.fit(X_for_fitting_cleaned, y)
+
+print("\nRedefined RandomForestClassifier pipeline trained successfully.")
+
+# Use the redefined and trained rf_pipeline to make predictions on the re-preprocessed new data
+# The pipeline will handle the preprocessing internally
+rf_predictions = trained_rf_pipeline_redefined.predict(X_new_for_transform)
+
+
+# Print the first few predictions
+print("\nFirst 10 RandomForestClassifier predictions after fixing preprocessor:", rf_predictions[:10])
+
+# Print the count of predicted labels
+print("\nRandomForestClassifier predicted label distribution after fixing preprocessor:\n", pd.Series(rf_predictions).value_counts())
+
+import numpy as np
+
+# Use the trained_if_pipeline to predict anomaly scores on the preprocessed new data
+# X_new_for_transform was created in the previous step, containing the new data with derived features,
+# excluding label, uid, and detailed-label, and with columns aligned to the training data.
+new_anomaly_scores = trained_if_pipeline.decision_function(X_new_for_transform)
+
+# Use the trained_if_pipeline to predict anomaly labels (-1 for outliers, 1 for inliers)
+new_if_predictions = trained_if_pipeline.predict(X_new_for_transform)
+
+# Convert anomaly labels (-1, 1) to match target variable labels (1 for malicious, 0 for benign)
+# Isolation Forest: -1 (outlier/malicious), 1 (inlier/benign)
+# Target variable: 1 (malicious), 0 (benign)
+# Mapping: -1 -> 1, 1 -> 0
+new_converted_labels = np.where(new_if_predictions == -1, 1, 0)
+
+# Print the first few values of new_anomaly_scores and new_converted_labels
+print("First 10 new anomaly scores (Isolation Forest):", new_anomaly_scores[:10])
+print("First 10 new converted labels (Isolation Forest):", new_converted_labels[:10])
+
+# Print the value counts of new_converted_labels
+print("\nIsolation Forest predicted label distribution on new data:\n", pd.Series(new_converted_labels).value_counts())
+
+import pandas as pd
+import numpy as np
+
+# 1. Combine the predictions from both models
+# Assuming rf_predictions and new_converted_labels are numpy arrays
+# Combine them into a DataFrame for easier manipulation, ensuring they have the same index/order as X_new_for_transform
+combined_predictions = pd.DataFrame({
+    'rf_prediction': rf_predictions,
+    'if_prediction': new_converted_labels
+}, index=X_new_for_transform.index) # Use the index of the preprocessed new data
+
+
+# 2. Implement a logic to determine the final malicious/benign label
+# Logic: Flag as malicious (1) if EITHER model predicts it as malicious (1)
+# Otherwise, flag as benign (0)
+final_predictions = combined_predictions['rf_prediction'] | combined_predictions['if_prediction']
+
+# Store the final determined labels in a new variable (already done above)
+# final_predictions is now a pandas Series
+
+# 4. Print the value counts of the final_predictions
+print("Final determined label distribution (combined model predictions):\n", final_predictions.value_counts())
+
+# Check if any malicious packets were detected
+if final_predictions.sum() > 0:
+    print("--- Malicious Packet Alerts ---")
+    # Iterate through the final_predictions Series
+    for index, prediction in final_predictions.items():
+        # Check if the prediction is 1 (malicious)
+        if prediction == 1:
+            # Access the corresponding row in the original new_df using the index
+            malicious_row = new_df.loc[index]
+
+            # Construct and print the alert message
+            alert_message = f"ALERT! Malicious packet detected at index {index}:\n"
+            alert_message += f"  UID: {malicious_row['uid']}\n"
+            alert_message += f"  Timestamp: {malicious_row['ts']}\n"
+            alert_message += f"  Source IP: {malicious_row['id.orig_h']}\n"
+            alert_message += f"  Source Port: {malicious_row['id.orig_p']}\n"
+            alert_message += f"  Destination IP: {malicious_row['id.resp_h']}\n"
+            alert_message += f"  Destination Port: {malicious_row['id.resp_p']}\n"
+            alert_message += f"  Protocol: {malicious_row['proto']}\n"
+            alert_message += f"  Service: {malicious_row['service']}\n"
+            alert_message += f"  Duration: {malicious_row['duration']}\n"
+            alert_message += f"  Original Bytes: {malicious_row['orig_bytes']}\n"
+            alert_message += f"  Response Bytes: {malicious_row['resp_bytes']}\n"
+            alert_message += f"  Connection State: {malicious_row['conn_state']}\n"
+            alert_message += "-------------------------------\n"
+            print(alert_message)
+else:
+    print("No malicious packets detected. No alerts triggered.")
